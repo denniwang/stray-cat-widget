@@ -15,6 +15,8 @@ lipo -create build/.arm64 build/.x86_64 -output "$APP/Contents/MacOS/StrayCat"
 rm -f build/.arm64 build/.x86_64
 
 cp Info.plist "$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # CI passes VERSION (for example 1.2.0, from the v1.2.0 tag) so the app reports the release it came from.
 if [ -n "$VERSION" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
