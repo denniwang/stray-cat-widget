@@ -43,8 +43,8 @@ Requires macOS 13 or later. Runs on Apple Silicon and Intel.
 
 ## Using it
 
-Look for the menu bar icons: 🐈 (menu), ⚙︎ (settings), ⏱ (start the break countdown). Launching the app a
-second time also opens Settings.
+Look for the 🐈 in the menu bar: its menu has Settings, the break countdown, and "Call the cat". Launching the
+app a second time also opens Settings.
 
 ## Build from source
 

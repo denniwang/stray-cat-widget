@@ -1348,8 +1348,6 @@ final class ActionBox: NSObject {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var settingsStatusItem: NSStatusItem!
-    private var countdownStatusItem: NSStatusItem!
     private let peeker = CatPeeker()
     private let overlay = BreakOverlay()
     private let headsUp = HeadsUp()
@@ -1381,23 +1379,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Quit Stray Cat", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         menu.items.forEach { if $0.action != nil && $0.action != #selector(NSApplication.terminate(_:)) { $0.target = self } }
         statusItem.menu = menu
-
-        // A separate gear icon that opens the settings window with one click.
-        settingsStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = settingsStatusItem.button {
-            button.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Stray Cat Settings")
-            button.target = self
-            button.action = #selector(openSettings)
-        }
-
-        // A third button that starts the break countdown (the same heads-up card the hourly timer shows).
-        countdownStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = countdownStatusItem.button {
-            button.image = NSImage(systemSymbolName: "timer", accessibilityDescription: "Start break countdown")
-            button.toolTip = "Start break countdown"
-            button.target = self
-            button.action = #selector(startCountdown)
-        }
 
         // If macOS hides our menu bar items (crowded bar, notch, or a per-app toggle in
         // System Settings > Menu Bar), open Settings so the app is still reachable.

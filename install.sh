@@ -80,5 +80,5 @@ fi
 
 if [ -z "${STRAYCAT_NO_LAUNCH:-}" ]; then
     open "$dest/$APP"
-    say "Look for the 🐈, ⚙︎ and ⏱ icons in your menu bar."
+    say "Look for the 🐈 icon in your menu bar."
 fi
