@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app
+        run: ./build.sh
+      - name: Check the binary
+        run: |
+          lipo -archs build/StrayCat.app/Contents/MacOS/StrayCat
+          codesign --verify --verbose build/StrayCat.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StrayCat
+          path: build/StrayCat.zip
