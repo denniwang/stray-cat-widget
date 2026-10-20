@@ -1,6 +1,6 @@
 cask "straycat" do
-  version "1.0.0"
-  sha256 "1124cc6df12e3cd748b5e67c0c2bc6e137750c632e3778fbf48e88aad8fb68af"
+  version "1.0.1"
+  sha256 "3b3320d633b5621d36591750abfd4b801611a071bad97b3f327f5bcc4dd3219d"
 
   url "https://github.com/denniwang/stray-cat-widget/releases/download/v#{version}/StrayCat.zip"
   name "Stray Cat"
