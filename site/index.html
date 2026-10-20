@@ -3,100 +3,141 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stray Cat – a break reminder for your Mac</title>
-<meta name="description" content="A stray cat pops into the corner of your screen, and once an hour nudges you to rest your eyes. Free menu bar app for macOS.">
+<meta name="description" content="A little cat that visits your Mac, then gently reminds you to take a break.">
+<title>Stray Cat — a gentler break for your Mac</title>
 <style>
   :root {
-    --bg: #faf7f2; --fg: #25211d; --muted: #6e665e; --card: #ffffff; --line: #e8e1d7; --accent: #c8702a; --accent-fg: #fff;
+    color-scheme: light;
+    --bg: #f7f4ee;
+    --fg: #28251f;
+    --muted: #746d63;
+    --accent: #c97039;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #17140f; --fg: #f2ece3; --muted: #a79d90; --card: #211d17; --line: #332d24; --accent: #e08b45; --accent-fg: #1a1209; }
+    :root { color-scheme: dark; --bg: #171a1d; --fg: #f4f0e8; --muted: #aaa59c; --accent: #e29662; }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 56px 20px 80px; }
-  .hero { text-align: center; }
-  .cat { width: 150px; height: 150px; margin: 0 auto 8px; display: block; }
-  .tail { transform-origin: 116px 12px; animation: wag 2.2s ease-in-out infinite; }
-  @keyframes wag { 50% { transform: rotate(14deg); } }
-  .eye { animation: blink 3.4s infinite; transform-origin: center; transform-box: fill-box; }
-  @keyframes blink { 0%, 96%, 100% { transform: scaleY(1); } 98% { transform: scaleY(.1); } }
-  @media (prefers-reduced-motion: reduce) { .tail, .eye { animation: none; } }
-  h1 { font-size: clamp(34px, 7vw, 52px); line-height: 1.1; margin: 8px 0 12px; letter-spacing: -0.02em; }
-  .lede { color: var(--muted); font-size: 19px; max-width: 34em; margin: 0 auto 28px; }
-  .btn { display: inline-block; background: var(--accent); color: var(--accent-fg); text-decoration: none; font-weight: 600;
-         padding: 13px 26px; border-radius: 12px; }
-  .btn:hover { filter: brightness(1.06); }
-  .btn:focus-visible, a:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
-  .meta { color: var(--muted); font-size: 14px; margin-top: 12px; }
-  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin: 56px 0 8px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 18px 16px; }
-  .card h3 { margin: 0 0 6px; font-size: 17px; }
-  .card p { margin: 0; color: var(--muted); font-size: 15px; }
-  h2 { margin: 52px 0 12px; font-size: 24px; letter-spacing: -0.01em; }
-  ol { padding-left: 22px; } li { margin: 8px 0; }
-  pre.cmd { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; overflow-x: auto; margin: 8px 0 18px; }
-  pre.cmd code { background: none; border: 0; padding: 0; font-size: 14px; }
-  code { background: var(--card); border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; font-size: 14px; }
-  .note { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; color: var(--muted); font-size: 15px; }
-  a { color: var(--accent); }
-  footer { margin-top: 64px; color: var(--muted); font-size: 14px; text-align: center; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 1120px; margin: 0 auto; padding: 30px 28px 36px; }
+  .wordmark { color: var(--fg); font-size: 12px; font-weight: 700; letter-spacing: .16em; }
+  .wordmark span { margin-left: 8px; color: var(--muted); font-weight: 500; }
+  .hero { max-width: 760px; margin: clamp(48px, 9vh, 92px) auto 52px; text-align: center; }
+  h1 { margin: 0; font-size: clamp(42px, 7vw, 76px); line-height: .99; letter-spacing: -.055em; font-weight: 650; }
+  .lede { max-width: 34em; margin: 22px auto 24px; color: var(--muted); font-size: clamp(17px, 2vw, 20px); }
+  .button { display: inline-block; padding: 12px 20px; border-radius: 7px; background: var(--accent); color: #fff; text-decoration: none; font-weight: 650; }
+  .button:hover { filter: brightness(1.06); }
+  a:focus-visible, video:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+  .meta { margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+  .demo { margin: 0; }
+  .demo video { display: block; width: 100%; height: auto; border-radius: 9px; background: #14191d; }
+  .caption { display: flex; justify-content: space-between; gap: 16px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+  .install { margin-top: 58px; padding-top: 24px; border-top: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); }
+  .install h2 { margin: 0 0 10px; font-size: 27px; letter-spacing: -.035em; }
+  .install-method { display: grid; grid-template-columns: minmax(150px, .34fr) 1fr; gap: 24px; align-items: center; padding: 16px 0; border-top: 1px solid color-mix(in srgb, var(--muted) 18%, transparent); }
+  .install-method h3 { margin: 0; font-size: 15px; }
+  .install-method p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+  .command { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border-radius: 8px; background: #1b2024; color: #f4f0e8; }
+  .command code { overflow-wrap: anywhere; white-space: pre-wrap; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .copy-button { flex: none; border: 1px solid #666a6b; border-radius: 6px; padding: 6px 10px; background: transparent; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
+  .copy-button:hover { background: #30373c; }
+  .copy-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 56px; padding-top: 18px; border-top: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); color: var(--muted); font-size: 13px; }
+  footer a { color: inherit; text-decoration-color: color-mix(in srgb, var(--muted) 55%, transparent); text-underline-offset: 3px; }
+  @media (max-width: 600px) {
+    main { padding: 24px 16px 28px; }
+    .hero { margin: 58px auto 36px; }
+    .demo video { border-radius: 5px; }
+    .caption, footer { flex-direction: column; gap: 4px; }
+    .install-method { grid-template-columns: 1fr; gap: 10px; }
+    footer { margin-top: 36px; }
+  }
 </style>
 </head>
 <body>
 <main>
+  <header class="wordmark">STRAY CAT <span>FOR MAC</span></header>
+
   <section class="hero">
-    <svg class="cat" viewBox="0 -10 175 165" role="img" aria-label="A grey stray cat sitting and wagging its tail">
-      <path class="tail" d="M116 12 C150 8 160 40 150 70" fill="none" stroke="#85786e" stroke-width="10" stroke-linecap="round" transform="translate(0,0)"/>
-      <ellipse cx="80" cy="32" rx="47" ry="46" fill="#85786e"/>
-      <ellipse cx="80" cy="33" rx="18" ry="25" fill="#ccc2b3"/>
-      <ellipse cx="63" cy="9" rx="11" ry="13" fill="#ccc2b3"/><ellipse cx="97" cy="9" rx="11" ry="13" fill="#ccc2b3"/>
-      <path d="M42 108 L44 150 L55 143 L60 149 L74 128Z" fill="#85786e" transform="translate(0,-8)"/>
-      <path d="M118 108 L116 150 L86 128Z" fill="#85786e" transform="translate(0,-8)"/>
-      <ellipse cx="80" cy="103" rx="42" ry="35" fill="#85786e" transform="translate(0,-24)"/>
-      <g class="eye"><ellipse cx="62" cy="79" rx="9" ry="8.5" fill="#dbd133"/><rect x="60" y="71" width="4" height="15" rx="2" fill="#000"/></g>
-      <g class="eye"><ellipse cx="98" cy="79" rx="9" ry="8.5" fill="#dbd133"/><rect x="96" y="71" width="4" height="15" rx="2" fill="#000"/></g>
-      <path d="M75 62 L85 62 L80 68Z" fill="#d98090"/>
-    </svg>
-    <h1>A little cat that tells you to rest your eyes.</h1>
-    <p class="lede">Stray Cat lives in your Mac's menu bar. It pops into a corner of your screen every now and then, and once an hour it asks you to look away.</p>
-    <a class="btn" id="download" href="https://github.com/denniwang/stray-cat-widget/releases/latest/download/StrayCat.zip">Download for macOS</a>
-    <div class="meta">Free · macOS 13+ · Apple Silicon &amp; Intel · <span id="version">latest version</span></div>
+    <h1>A little company.<br>A better break.</h1>
+    <p class="lede">A stray cat drops by your screen now and then. When it’s time to pause, it helps you look away.</p>
+    <a class="button" href="https://github.com/denniwang/stray-cat-widget/releases/latest/download/StrayCat.zip">Download for macOS</a>
+    <p class="meta">Free · macOS 13+ · Apple Silicon and Intel</p>
   </section>
 
-  <section class="grid" aria-label="Features">
-    <div class="card"><h3>Pop-up cat</h3><p>Peeks in from a bottom corner at random times, then wanders off. Click it to send it away.</p></div>
-    <div class="card"><h3>Gentle warning</h3><p>A 15-second countdown card in the corner, with Skip and Snooze. Nothing dims until it ends.</p></div>
-    <div class="card"><h3>Real break</h3><p>The screen dims over everything, full-screen apps included, with a countdown and a random cat or GIF.</p></div>
-    <div class="card"><h3>Your pictures</h3><p>Add your own images and GIFs, or pull a random GIF from a Tenor search such as “aura”.</p></div>
-    <div class="card"><h3>Screen-share safe</h3><p>Stays hidden while you share on Zoom or are on a call, so it never interrupts a meeting.</p></div>
-    <div class="card"><h3>Yours to tune</h3><p>Interval, break length, dimming, snooze and start-at-login, all in one small settings window.</p></div>
-  </section>
+  <figure class="demo">
+    <video class="demo-video" controls muted loop playsinline preload="metadata"
+           poster="assets/stray-cat-demo-poster.jpg" aria-label="Full desktop recording showing Stray Cat's break reminder">
+      <source src="assets/stray-cat-desktop-demo.mp4" type="video/mp4">
+      Your browser does not support embedded video.
+    </video>
+    <figcaption class="caption">
+      <span>Recorded from the full Mac desktop.</span>
+      <span>Break warning · full-screen pause</span>
+    </figcaption>
+  </figure>
 
-  <h2>Install</h2>
-  <p>Paste this into Terminal. It downloads the latest version into Applications and opens it, with no security warning:</p>
-  <pre class="cmd"><code id="cmd-curl">curl -fsSL https://raw.githubusercontent.com/denniwang/stray-cat-widget/main/install.sh | bash</code></pre>
-  <p>Use Homebrew? Run this instead:</p>
-  <pre class="cmd"><code>brew tap denniwang/stray-cat-widget https://github.com/denniwang/stray-cat-widget
-brew install --cask denniwang/stray-cat-widget/straycat</code></pre>
-  <p>Prefer the download button? The app isn't notarized by Apple, so macOS may say it is “damaged” or can't verify it. That's the
-  quarantine flag on downloaded files, not a real problem. Run this once, then open the app:</p>
-  <pre class="cmd"><code>xattr -dr com.apple.quarantine /Applications/StrayCat.app</code></pre>
-  <p class="note">Screen-share detection is best-effort: it recognises Zoom shares and any app using the microphone, but not every screen-sharing tool.</p>
+  <section class="install" id="install" aria-labelledby="install-title">
+    <h2 id="install-title">Get Stray Cat</h2>
+    <div class="install-method">
+      <div>
+        <h3>Quick install</h3>
+        <p>Downloads the latest version and opens it.</p>
+      </div>
+      <div class="command">
+        <code>curl -fsSL https://raw.githubusercontent.com/denniwang/stray-cat-widget/main/install.sh | bash</code>
+        <button class="copy-button" type="button" aria-label="Copy quick install command">Copy</button>
+      </div>
+    </div>
+    <div class="install-method">
+      <div>
+        <h3>Homebrew</h3>
+        <p>Install from the Stray Cat tap.</p>
+      </div>
+      <div class="command">
+        <code>brew tap denniwang/stray-cat-widget https://github.com/denniwang/stray-cat-widget
+brew install --cask denniwang/stray-cat-widget/straycat</code>
+        <button class="copy-button" type="button" aria-label="Copy Homebrew install commands">Copy</button>
+      </div>
+    </div>
+  </section>
 
   <footer>
-    Open source (MIT) · <a id="source" href="https://github.com/denniwang/stray-cat-widget">View the code on GitHub</a>
+    <span>Open source · MIT License</span>
+    <a href="https://github.com/denniwang/stray-cat-widget">View the project on GitHub</a>
   </footer>
 </main>
 <script>
-  // Shows the newest release number next to the button. The button itself always points at /releases/latest,
-  // so it works even if this request fails.
   (function () {
-    var repo = document.getElementById("source").href.replace("https://github.com/", "");
-    fetch("https://api.github.com/repos/" + repo + "/releases/latest")
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (r) { if (r && r.tag_name) document.getElementById("version").textContent = r.tag_name; })
-      .catch(function () {});
+    var demo = document.querySelector(".demo-video");
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      demo.play().catch(function () {});
+    }
+
+    document.querySelectorAll(".copy-button").forEach(function (button) {
+      button.addEventListener("click", async function () {
+        var code = button.parentElement.querySelector("code").textContent.trim();
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(code);
+          } else {
+            var field = document.createElement("textarea");
+            field.value = code;
+            field.style.position = "fixed";
+            field.style.opacity = "0";
+            document.body.appendChild(field);
+            field.select();
+            var copied = document.execCommand("copy");
+            field.remove();
+            if (!copied) throw new Error("Clipboard copy failed");
+          }
+          button.textContent = "Copied";
+          window.setTimeout(function () { button.textContent = "Copy"; }, 1600);
+        } catch (_) {
+          button.textContent = "Copy failed";
+          window.setTimeout(function () { button.textContent = "Copy"; }, 1600);
+        }
+      });
+    });
   })();
 </script>
 </body>

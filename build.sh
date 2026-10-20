@@ -6,8 +6,14 @@ APP=build/StrayCat.app
 rm -rf "$APP" build/StrayCat.zip build/StrayCat.zip.sha256 build/.arm64 build/.x86_64
 mkdir -p "$APP/Contents/MacOS"
 
+DEMO_SWIFT_FLAGS=
+if [ "${DEMO_CAPTURE:-0}" = "1" ]; then
+    DEMO_SWIFT_FLAGS="-D DEMO_CAPTURE"
+fi
+
 for arch in arm64 x86_64; do
-    swiftc -O -swift-version 5 -target "$arch-apple-macos13.0" \
+    # DEMO_SWIFT_FLAGS is an optional pair of fixed compiler arguments.
+    swiftc $DEMO_SWIFT_FLAGS -O -swift-version 5 -target "$arch-apple-macos13.0" \
         -framework AppKit -framework ServiceManagement -framework CoreAudio \
         -o "build/.$arch" Sources/main.swift
 done
@@ -17,6 +23,9 @@ rm -f build/.arm64 build/.x86_64
 cp Info.plist "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+if [ "${DEMO_CAPTURE:-0}" = "1" ]; then
+    cp Resources/demo-cat.gif "$APP/Contents/Resources/demo-cat.gif"
+fi
 # CI passes VERSION (for example 1.2.0, from the v1.2.0 tag) so the app reports the release it came from.
 if [ -n "$VERSION" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"

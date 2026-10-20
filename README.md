@@ -14,6 +14,16 @@ with a countdown.
   while the microphone is in use.
 - Start at login, all timings adjustable from the settings window.
 
+## See it in action
+
+<table>
+  <tr><th>Pop-up cat</th><th>Break screen</th></tr>
+  <tr>
+    <td><img src="site/assets/stray-cat-popup.gif" alt="A cat popping up in the corner of the screen" width="400"></td>
+    <td><img src="site/assets/stray-cat-break.gif" alt="The dimmed break screen with a cat GIF and countdown" width="400"></td>
+  </tr>
+</table>
+
 ## Install
 
 **One-line install (recommended)**, which avoids macOS's "damaged" warning:

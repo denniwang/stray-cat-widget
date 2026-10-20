@@ -10,6 +10,16 @@ import UniformTypeIdentifiers
 enum Settings {
     private static let d = UserDefaults.standard
 
+#if DEMO_CAPTURE
+    /// Temporary switch for capturing the cat and break overlays in demo recordings.
+    static var demoMode = false
+    /// Use a bundled cat GIF and short break sequence for deterministic recordings.
+    static var demoSequenceMode = false
+    static var overlaySharingType: NSWindow.SharingType { demoMode ? .readOnly : .none }
+#else
+    static var overlaySharingType: NSWindow.SharingType { .none }
+#endif
+
     static func register() {
         d.register(defaults: [
             "breaksEnabled": true, "breakMinutes": 60, "breakSeconds": 15,
@@ -523,8 +533,13 @@ final class CatPeeker {
     private let cooldown: TimeInterval = 5
 
     func peek() {
+        #if DEMO_CAPTURE
+        let canShowWhileSharing = Settings.demoMode || !ShareGuard.isSharing()
+        #else
+        let canShowWhileSharing = !ShareGuard.isSharing()
+        #endif
         guard !busy, Date().timeIntervalSince(lastEnd) >= cooldown,
-              !ShareGuard.isSharing(), let screen = NSScreen.main else { return }
+              canShowWhileSharing, let screen = NSScreen.main else { return }
         busy = true
 
         let size: CGFloat = 170
@@ -539,7 +554,7 @@ final class CatPeeker {
         w.backgroundColor = .clear
         w.hasShadow = false
         w.level = .floating
-        w.sharingType = .none
+        w.sharingType = Settings.overlaySharingType
         w.isReleasedWhenClosed = false
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
@@ -586,6 +601,12 @@ final class CatPeeker {
 
     /// Removes the cat immediately (used when a break starts).
     func dismissNow() { teardown() }
+
+#if DEMO_CAPTURE
+    func setSharingType(_ sharingType: NSWindow.SharingType) {
+        window?.sharingType = sharingType
+    }
+#endif
 }
 
 // MARK: - Heads-up before a break
@@ -603,6 +624,12 @@ final class HeadsUp {
 
     var isShowing: Bool { panel != nil }
 
+#if DEMO_CAPTURE
+    func setSharingType(_ sharingType: NSWindow.SharingType) {
+        panel?.sharingType = sharingType
+    }
+#endif
+
     func show(seconds: Int, onDone: @escaping (Outcome) -> Void) {
         guard !isShowing, let screen = NSScreen.main else { return }
         self.onDone = onDone
@@ -618,7 +645,7 @@ final class HeadsUp {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
-        p.sharingType = .none
+        p.sharingType = Settings.overlaySharingType
         p.isReleasedWhenClosed = false
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
 
@@ -723,6 +750,12 @@ final class BreakOverlay {
 
     var isShowing: Bool { !windows.isEmpty }
 
+#if DEMO_CAPTURE
+    func setSharingType(_ sharingType: NSWindow.SharingType) {
+        windows.forEach { $0.sharingType = sharingType }
+    }
+#endif
+
     func show(onFinish: @escaping (_ snoozed: Bool) -> Void) {
         guard !isShowing else { return }
         self.onFinish = onFinish
@@ -734,7 +767,7 @@ final class BreakOverlay {
             let w = OverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
             w.setFrame(screen.frame, display: true)
             w.level = shielding
-            w.sharingType = .none
+            w.sharingType = Settings.overlaySharingType
             w.isOpaque = false
             w.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(Settings.dimPercent) / 100)
             w.hasShadow = false
@@ -756,7 +789,12 @@ final class BreakOverlay {
         }
 
         // Swap in a random online GIF once it arrives; the local/drawn cat shows until then (or if it fails).
-        if Settings.onlineGifs, Settings.showBreakMessage {
+#if DEMO_CAPTURE
+        let shouldFetchOnlineGif = !Settings.demoSequenceMode && Settings.onlineGifs && Settings.showBreakMessage
+#else
+        let shouldFetchOnlineGif = Settings.onlineGifs && Settings.showBreakMessage
+#endif
+        if shouldFetchOnlineGif {
             OnlineGIF.random(from: Settings.onlineURL) { [weak self] image in
                 guard let self, self.isShowing, let image else { return }
                 self.breakCat?.customImage = image
@@ -787,7 +825,15 @@ final class BreakOverlay {
         let cx = b.midX
         let cat = CatView(frame: NSRect(x: cx - 120, y: b.midY + 20, width: 240, height: 240))
         cat.peek = 1
+#if DEMO_CAPTURE
+        if Settings.demoSequenceMode {
+            cat.customImage = Bundle.main.url(forResource: "demo-cat", withExtension: "gif").flatMap(AnimatedImage.init(url:))
+        } else {
+            cat.customImage = Settings.randomImage(for: .breakScreen) ?? Settings.randomImage(for: .popup)
+        }
+#else
         cat.customImage = Settings.randomImage(for: .breakScreen) ?? Settings.randomImage(for: .popup)
+#endif
         breakCat = cat
         view.addSubview(cat)
 
@@ -957,6 +1003,21 @@ final class ThumbView: NSView {
 
 // MARK: - Settings window
 
+/// Ensures the standard Select All shortcut reaches AppKit's shared text-field editor.
+final class SettingsWindow: NSWindow {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "a",
+           let editor = firstResponder as? NSTextView,
+           editor.isFieldEditor {
+            editor.selectAll(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 /// A small form that edits `Settings`. Every change is saved and applied immediately.
 final class SettingsWindowController: NSWindowController {
     private struct Row {
@@ -973,8 +1034,8 @@ final class SettingsWindowController: NSWindowController {
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 10),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let w = SettingsWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 10),
+                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Stray Cat Settings"
         w.isReleasedWhenClosed = false
         super.init(window: w)
@@ -1362,6 +1423,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Settings.register()
+        #if DEMO_CAPTURE
+        let launchArguments = ProcessInfo.processInfo.arguments
+        Settings.demoSequenceMode = launchArguments.contains("--demo-sequence")
+        Settings.demoMode = launchArguments.contains("--demo-mode") || Settings.demoSequenceMode
+        #endif
         Settings.migrateLegacyImages()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "🐈"
@@ -1373,6 +1439,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Call the cat", action: #selector(peekNow), keyEquivalent: "c"))
         menu.addItem(NSMenuItem(title: "Start break countdown", action: #selector(startCountdown), keyEquivalent: "t"))
         menu.addItem(NSMenuItem(title: "Take a break now", action: #selector(breakNow), keyEquivalent: "b"))
+#if DEMO_CAPTURE
+        menu.addItem(.separator())
+        let demoModeItem = NSMenuItem(title: "Demo Mode (capture overlays while sharing)", action: #selector(toggleDemoMode(_:)), keyEquivalent: "")
+        demoModeItem.state = Settings.demoMode ? .on : .off
+        menu.addItem(demoModeItem)
+#endif
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
@@ -1401,6 +1473,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Settings.catEnabled {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.peeker.peek() }
         }
+#if DEMO_CAPTURE
+        if launchArguments.contains("--demo-sequence") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                self?.startBreak(warn: true, countdown: 3)
+            }
+        }
+#endif
     }
 
     private func schedulePeek() {
@@ -1430,7 +1509,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startBreak(warn: Bool = true, countdown: Int? = nil) {
         guard !overlay.isShowing, !headsUp.isShowing else { return }
         // Never dim the screen while it may be visible to other people; retry shortly.
-        if ShareGuard.isSharing() {
+#if DEMO_CAPTURE
+        let canStartWhileSharing = Settings.demoMode
+#else
+        let canStartWhileSharing = false
+#endif
+        if !canStartWhileSharing && ShareGuard.isSharing() {
             breakWaiting = true
             breakTimer?.invalidate()
             breakTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in self?.startBreak() }
@@ -1472,6 +1556,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func peekNow() { if !overlay.isShowing && !headsUp.isShowing { peeker.peek() } }
+
+#if DEMO_CAPTURE
+    @objc private func toggleDemoMode(_ sender: NSMenuItem) {
+        Settings.demoMode.toggle()
+        sender.state = Settings.demoMode ? .on : .off
+        let sharingType = Settings.overlaySharingType
+        peeker.setSharingType(sharingType)
+        headsUp.setSharingType(sharingType)
+        overlay.setSharingType(sharingType)
+    }
+#endif
+
     @objc private func breakNow() {
         // Ignore repeats while a break is up or has only just ended (its fade-out counts as ending).
         guard !overlay.isShowing, !headsUp.isShowing, Date().timeIntervalSince(lastBreakEnd) > 3 else { return }
