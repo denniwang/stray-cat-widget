@@ -4,12 +4,12 @@ A tiny macOS menu bar app. A stray cat pops up in a corner of your screen every 
 hour it nudges you to take a screen break: a 15-second heads-up card, then a dimmed full-screen break
 with a countdown.
 
-- **Pop-up cat** that peeks in from a bottom corner at random times. Use the drawn cat (random coat each
-  time) or your own pictures and GIFs.
+- **Pop-up cat** that peeks in from a bottom corner at random times. Use the drawn cat, your own pictures,
+  or random GIFs from a search you choose.
 - **Break reminder** every hour (configurable): warning card with Skip / Snooze / Start now, then a dimmed
   screen over everything, including full-screen apps.
-- **Break screen picture:** your own images, or a random GIF from a Tenor search page (default
-  `https://tenor.com/search/aura-gifs`, or type any words).
+- **Break screen picture:** your own images, or a random GIF from a Tenor search (default search: `cats`).
+  Pop-up cats can use a separate GIF search.
 - **Stays out of the way while you screen-share:** no cat and no dimming during a detected Zoom share or
   while the microphone is in use.
 - Start at login, all timings adjustable from the settings window.

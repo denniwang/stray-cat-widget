@@ -23,6 +23,8 @@ rm -f build/.arm64 build/.x86_64
 cp Info.plist "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp site/assets/stray-cat-popup.gif "$APP/Contents/Resources/onboarding-popup.gif"
+cp site/assets/stray-cat-break.gif "$APP/Contents/Resources/onboarding-break.gif"
 if [ "${DEMO_CAPTURE:-0}" = "1" ]; then
     cp Resources/demo-cat.gif "$APP/Contents/Resources/demo-cat.gif"
 fi

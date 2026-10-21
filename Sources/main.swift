@@ -25,17 +25,42 @@ enum Settings {
             "breaksEnabled": true, "breakMinutes": 60, "breakSeconds": 15,
             "snoozeMinutes": 5, "dimPercent": 82,
             "catEnabled": true, "catEveryMinutes": 8, "catStaySeconds": 6,
+            "popupOnlineGifs": false, "popupOnlineURL": "",
             "showBreakMessage": true, "holdDuringShare": true, "holdDuringCalls": true,
-            "warnSeconds": 15, "onlineGifs": true, "onlineURL": "https://tenor.com/search/aura-gifs",
+            "warnSeconds": 15, "onlineGifs": true, "onlineURL": "cats",
         ])
     }
 
+    static var popupOnlineGifs: Bool { get { d.bool(forKey: "popupOnlineGifs") } set { d.set(newValue, forKey: "popupOnlineGifs") } }
+    static var popupOnlineURL: String { get { d.string(forKey: "popupOnlineURL") ?? "" } set { d.set(newValue, forKey: "popupOnlineURL") } }
     static var holdDuringShare: Bool { get { d.bool(forKey: "holdDuringShare") } set { d.set(newValue, forKey: "holdDuringShare") } }
     static var holdDuringCalls: Bool { get { d.bool(forKey: "holdDuringCalls") } set { d.set(newValue, forKey: "holdDuringCalls") } }
     static var warnSeconds: Int { get { d.integer(forKey: "warnSeconds") } set { d.set(newValue, forKey: "warnSeconds") } }
     static var onlineGifs: Bool { get { d.bool(forKey: "onlineGifs") } set { d.set(newValue, forKey: "onlineGifs") } }
     static var onlineURL: String { get { d.string(forKey: "onlineURL") ?? "" } set { d.set(newValue, forKey: "onlineURL") } }
     static var showBreakMessage: Bool { get { d.bool(forKey: "showBreakMessage") } set { d.set(newValue, forKey: "showBreakMessage") } }
+
+    static func shouldShowOnboarding() -> Bool {
+        let key = "hasCompletedOnboarding"
+        if d.bool(forKey: key) { return false }
+
+        // Existing installs with saved preferences or custom pictures skip the welcome window.
+        let domain = Bundle.main.bundleIdentifier.flatMap { d.persistentDomain(forName: $0) } ?? [:]
+        let priorKeys = [
+            "breaksEnabled", "breakMinutes", "breakSeconds", "snoozeMinutes", "dimPercent",
+            "catEnabled", "catEveryMinutes", "catStaySeconds", "showBreakMessage",
+            "holdDuringShare", "holdDuringCalls", "warnSeconds", "onlineGifs", "onlineURL",
+        ]
+        let hasSavedPreferences = priorKeys.contains { domain[$0] != nil }
+        let hasCustomImages = !galleryFiles(for: .popup).isEmpty || !galleryFiles(for: .breakScreen).isEmpty
+        if hasSavedPreferences || hasCustomImages || SMAppService.mainApp.status == .enabled {
+            d.set(true, forKey: key)
+            return false
+        }
+        return true
+    }
+
+    static func markOnboardingComplete() { d.set(true, forKey: "hasCompletedOnboarding") }
 
     /// Which place a gallery is used.
     enum Slot: String {
@@ -162,6 +187,7 @@ final class AnimatedImage {
     private let delays: [TimeInterval]
     private let total: TimeInterval
     let size: CGSize
+    let fileURL: URL
 
     init?(url: URL) {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
@@ -185,6 +211,7 @@ final class AnimatedImage {
         self.delays = delays
         self.total = delays.reduce(0, +)
         self.size = CGSize(width: first.width, height: first.height)
+        self.fileURL = url
     }
 
     private static func delay(_ src: CGImageSource, _ index: Int) -> TimeInterval {
@@ -221,7 +248,16 @@ final class AnimatedImage {
 enum OnlineGIF {
     private static var cache: [URL: (date: Date, urls: [URL])] = [:]
     private static let maxBytes = 8 * 1024 * 1024
+    private static let maxCachedGIFs = 10
+    private static let diskCacheLock = NSLock()
     private static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+    /// GIFs that have loaded successfully are kept in Application Support for offline use.
+    private static var diskCacheDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("StrayCat", isDirectory: true)
+            .appendingPathComponent("OnlineGIFCache", isDirectory: true)
+    }
 
     /// Accepts a full URL, or plain words (turned into a Tenor search such as .../search/aura-gifs).
     static func resolve(_ input: String) -> URL? {
@@ -251,12 +287,12 @@ enum OnlineGIF {
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         URLSession.shared.dataTask(with: request) { data, response, _ in
             guard (response as? HTTPURLResponse)?.statusCode == 200, let data, data.count < 6_000_000 else {
-                DispatchQueue.main.async { completion(nil) }
+                DispatchQueue.main.async { completeWithCachedGIF(completion) }
                 return
             }
             let urls = gifLinks(in: String(decoding: data, as: UTF8.self))
             DispatchQueue.main.async {
-                guard !urls.isEmpty else { completion(nil); return }
+                guard !urls.isEmpty else { completeWithCachedGIF(completion); return }
                 cache[page] = (Date(), urls)
                 download(urls.shuffled(), completion)
             }
@@ -281,7 +317,7 @@ enum OnlineGIF {
     private static func download(_ candidates: [URL], _ completion: @escaping (AnimatedImage?) -> Void) {
         var queue = Array(candidates.prefix(3))
         func next() {
-            guard !queue.isEmpty else { completion(nil); return }
+            guard !queue.isEmpty else { completeWithCachedGIF(completion); return }
             var request = URLRequest(url: queue.removeFirst())
             request.timeoutInterval = 12
             request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
@@ -291,13 +327,70 @@ enum OnlineGIF {
                     let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("straycat-\(UUID().uuidString).gif")
                     if (try? data.write(to: tmp)) != nil {
                         image = AnimatedImage(url: tmp)
-                        try? FileManager.default.removeItem(at: tmp)
+                        if image != nil {
+                            if let cachedURL = storeInDiskCache(data), let cachedImage = AnimatedImage(url: cachedURL) {
+                                image = cachedImage
+                                try? FileManager.default.removeItem(at: tmp)
+                            }
+                            // Keep the temporary source if the persistent cache was unavailable so
+                            // the user can still copy the GIF file from the preview.
+                        } else {
+                            try? FileManager.default.removeItem(at: tmp)
+                        }
                     }
                 }
                 DispatchQueue.main.async { if let image { completion(image) } else { next() } }
             }.resume()
         }
         next()
+    }
+
+    /// Returns a random readable GIF from the last ten successful downloads.
+    private static func completeWithCachedGIF(_ completion: @escaping (AnimatedImage?) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            let files = cachedGIFFiles().shuffled()
+            var image: AnimatedImage?
+            for file in files {
+                if let decoded = AnimatedImage(url: file) {
+                    image = decoded
+                    break
+                }
+                try? FileManager.default.removeItem(at: file)
+            }
+            DispatchQueue.main.async { completion(image) }
+        }
+    }
+
+    /// Adds a validated download and prunes the oldest files to keep the disk cache bounded.
+    private static func storeInDiskCache(_ data: Data) -> URL? {
+        diskCacheLock.lock()
+        defer { diskCacheLock.unlock() }
+
+        let directory = diskCacheDirectory
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let timestamp = Int(Date().timeIntervalSince1970 * 1_000)
+            let destination = directory.appendingPathComponent("\(timestamp)-\(UUID().uuidString).gif")
+            try data.write(to: destination, options: .atomic)
+
+            let files = (try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
+            for oldFile in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(max(0, files.count - maxCachedGIFs)) {
+                try? FileManager.default.removeItem(at: oldFile)
+            }
+            return destination
+        } catch {
+            // Keep the online result usable even if Application Support is unavailable.
+            return nil
+        }
+    }
+
+    private static func cachedGIFFiles() -> [URL] {
+        diskCacheLock.lock()
+        defer { diskCacheLock.unlock() }
+        return (try? FileManager.default.contentsOfDirectory(
+            at: diskCacheDirectory, includingPropertiesForKeys: nil, options: .skipsHiddenFiles))?
+            .filter { $0.pathExtension.lowercased() == "gif" } ?? []
     }
 }
 
@@ -351,11 +444,23 @@ final class CatView: NSView {
     var peek: CGFloat = 0 { didSet { needsDisplay = true } }
     var facingLeft = false
     var onClick: (() -> Void)?
+    var onImageClick: (() -> Void)?
+    var onHoverChanged: ((Bool) -> Void)?
     /// When set, this is drawn instead of the built-in cat.
-    var customImage: AnimatedImage?
+    var customImage: AnimatedImage? {
+        didSet {
+            needsDisplay = true
+            if window != nil { updateTrackingAreas() }
+        }
+    }
 
     private var animTimer: Timer?
     private let epoch = Date()
+    private var hoverDimAlpha: CGFloat = 0
+    private var hoverDimFrom: CGFloat = 0
+    private var hoverDimTarget: CGFloat = 0
+    private var hoverDimStartedAt: TimeInterval?
+    private let hoverDimDuration: TimeInterval = 0.2
 
     /// Coat colors (fur, stripes, light patches) for the drawn cat; one is picked per appearance.
     private static let coats: [(fur: NSColor, stripe: NSColor, light: NSColor)] = {
@@ -379,26 +484,78 @@ final class CatView: NSView {
         animTimer?.invalidate()
         guard window != nil else { return }
         animTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            self?.updateHoverDimAnimation()
             self?.needsDisplay = true
         }
     }
 
     deinit { animTimer?.invalidate() }
 
-    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if let onImageClick, displayedImageRect()?.contains(point) == true {
+            onImageClick()
+        } else {
+            onClick?()
+        }
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: displayedImageRect() ?? bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .assumeInside],
+                                       owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
+    override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
+
+    func setGIFHovered(_ isHovered: Bool) {
+        hoverDimFrom = hoverDimAlpha
+        hoverDimTarget = isHovered ? 0.28 : 0
+        hoverDimStartedAt = Date().timeIntervalSinceReferenceDate
+        if window == nil {
+            hoverDimAlpha = hoverDimTarget
+            hoverDimStartedAt = nil
+        }
+        needsDisplay = true
+    }
+
+    func displayedImageRect(for image: AnimatedImage? = nil) -> NSRect? {
+        guard let image = image ?? customImage,
+              image.size.width > 0, image.size.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return nil }
+        let scale = min(bounds.width / image.size.width, bounds.height / image.size.height)
+        let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        return NSRect(x: (bounds.width - size.width) / 2,
+                      y: -(1 - peek) * bounds.height,
+                      width: size.width, height: size.height)
+    }
+
+    private func updateHoverDimAnimation() {
+        guard let startedAt = hoverDimStartedAt else { return }
+        let progress = CGFloat(min(1, (Date().timeIntervalSinceReferenceDate - startedAt) / hoverDimDuration))
+        let easedProgress = progress * progress * (3 - 2 * progress)
+        hoverDimAlpha = hoverDimFrom + (hoverDimTarget - hoverDimFrom) * easedProgress
+        if progress >= 1 {
+            hoverDimAlpha = hoverDimTarget
+            hoverDimStartedAt = nil
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         if let image = customImage {
             // Aspect-fit, resting on the bottom edge; not mirrored so text in an image stays readable.
-            let size = image.size
-            let scale = min(bounds.width / size.width, bounds.height / size.height)
-            let fitted = NSSize(width: size.width * scale, height: size.height * scale)
-            let rect = CGRect(x: (bounds.width - fitted.width) / 2, y: -(1 - peek) * bounds.height,
-                              width: fitted.width, height: fitted.height)
+            guard let rect = displayedImageRect(for: image) else { return }
             ctx.interpolationQuality = .high
             ctx.draw(image.frame(at: Date().timeIntervalSince(epoch)), in: rect)
+            if hoverDimAlpha > 0 {
+                ctx.setFillColor(NSColor(calibratedWhite: 0.58, alpha: hoverDimAlpha).cgColor)
+                ctx.fill(rect)
+            }
             return
         }
         let s = min(bounds.width, bounds.height) / 160
@@ -520,6 +677,139 @@ final class CatView: NSView {
 
 // MARK: - Peeking cat
 
+/// A compact speech bubble that points toward the cat and keeps its message readable on any wallpaper.
+final class CatSpeechBubbleView: NSView {
+    let tailOnRight: Bool
+    let label: NSTextField
+    var onClick: (() -> Void)?
+    private static let textFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    private static let maxTextWidth: CGFloat = 164
+
+    static func fittingSize(for text: String) -> NSSize {
+        let textBounds = (text as NSString).boundingRect(
+            with: NSSize(width: maxTextWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: textFont]
+        )
+        let textWidth = min(maxTextWidth, max(1, ceil(textBounds.width)))
+        let textHeight = max(16, ceil(textBounds.height))
+        return NSSize(width: textWidth + 40, height: textHeight + 20)
+    }
+
+    init(frame: NSRect, text: String, tailOnRight: Bool) {
+        self.tailOnRight = tailOnRight
+        label = NSTextField(wrappingLabelWithString: text)
+        super.init(frame: frame)
+        wantsLayer = true
+
+        let textSize = Self.fittingSize(for: text)
+        let bodyX: CGFloat = tailOnRight ? 0 : 12
+        label.font = Self.textFont
+        label.textColor = .white
+        label.alignment = .center
+        label.maximumNumberOfLines = 3
+        label.lineBreakMode = .byWordWrapping
+        label.frame = NSRect(x: bodyX + 14,
+                             y: (frame.height - textSize.height) / 2,
+                             width: frame.width - 40,
+                             height: textSize.height)
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let tailWidth: CGFloat = 12
+        let bodyRect = NSRect(x: tailOnRight ? 0 : tailWidth,
+                              y: 0,
+                              width: bounds.width - tailWidth,
+                              height: bounds.height)
+        let radius: CGFloat = 18
+        let tailY = bodyRect.midY
+        let body = NSBezierPath(roundedRect: bodyRect, xRadius: radius, yRadius: radius)
+        NSColor(calibratedWhite: 0.12, alpha: 0.94).setFill()
+        body.fill()
+        NSColor(calibratedWhite: 1, alpha: 0.12).setStroke()
+        body.lineWidth = 1
+        body.stroke()
+
+        let tail = NSBezierPath()
+        if tailOnRight {
+            tail.move(to: NSPoint(x: bodyRect.maxX, y: tailY + 8))
+            tail.line(to: NSPoint(x: bounds.maxX, y: tailY))
+            tail.line(to: NSPoint(x: bodyRect.maxX, y: tailY - 8))
+        } else {
+            tail.move(to: NSPoint(x: bodyRect.minX, y: tailY + 8))
+            tail.line(to: NSPoint(x: bounds.minX, y: tailY))
+            tail.line(to: NSPoint(x: bodyRect.minX, y: tailY - 8))
+        }
+        tail.close()
+        NSColor(calibratedWhite: 0.12, alpha: 0.94).setFill()
+        tail.fill()
+        NSColor(calibratedWhite: 1, alpha: 0.12).setStroke()
+        let tailEdge = NSBezierPath()
+        if tailOnRight {
+            tailEdge.move(to: NSPoint(x: bodyRect.maxX, y: tailY + 8))
+            tailEdge.line(to: NSPoint(x: bounds.maxX, y: tailY))
+            tailEdge.line(to: NSPoint(x: bodyRect.maxX, y: tailY - 8))
+        } else {
+            tailEdge.move(to: NSPoint(x: bodyRect.minX, y: tailY + 8))
+            tailEdge.line(to: NSPoint(x: bounds.minX, y: tailY))
+            tailEdge.line(to: NSPoint(x: bodyRect.minX, y: tailY - 8))
+        }
+        tailEdge.lineWidth = 1
+        tailEdge.stroke()
+    }
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
+/// Hosts the cat and its optional break countdown bubble in one animated corner window.
+final class CatPopupContentView: NSView {
+    let cat: CatView
+    let bubble: CatSpeechBubbleView?
+    private let catOnRight: Bool
+    private let bubbleBaseFrame: NSRect
+    var peek: CGFloat = 0 {
+        didSet {
+            cat.peek = peek
+            guard let bubble else { return }
+            let reveal = min(1, max(0, (peek - 0.08) / 0.92))
+            let fromCat: CGFloat = catOnRight ? 1 : -1
+            bubble.alphaValue = reveal
+            bubble.setFrameOrigin(NSPoint(x: bubbleBaseFrame.minX + fromCat * (1 - reveal) * 12,
+                                          y: bubbleBaseFrame.minY + (1 - reveal) * 4))
+        }
+    }
+
+    init(frame: NSRect, image: AnimatedImage?, catOnRight: Bool, message: String?) {
+        self.catOnRight = catOnRight
+        let catWidth: CGFloat = 170
+        let catX = catOnRight ? frame.width - catWidth : 0
+        let bubbleX = catOnRight ? 0 : catWidth
+        let bubbleSize = message.map(CatSpeechBubbleView.fittingSize(for:)) ?? .zero
+        let bubbleFrame = NSRect(x: bubbleX, y: 100 - bubbleSize.height / 2,
+                                 width: bubbleSize.width, height: bubbleSize.height)
+        bubbleBaseFrame = bubbleFrame
+        cat = CatView(frame: NSRect(x: catX, y: 0, width: catWidth, height: catWidth))
+        cat.facingLeft = catOnRight
+        cat.customImage = image
+        if let message {
+            bubble = CatSpeechBubbleView(frame: bubbleFrame, text: message, tailOnRight: catOnRight)
+        } else {
+            bubble = nil
+        }
+        super.init(frame: frame)
+        addSubview(cat)
+        if let bubble {
+            bubble.alphaValue = 0
+            addSubview(bubble)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 /// Shows the cat in a bottom corner, slides it up, waits, and slides it back down.
 /// Only one cat exists at a time, every animation can be cancelled, and appearances are rate-limited,
 /// so repeated "Call the cat" clicks (or a held key) can't stack, flicker, or corrupt a later cat.
@@ -532,22 +822,30 @@ final class CatPeeker {
     /// Minimum quiet time after a cat leaves before another can appear.
     private let cooldown: TimeInterval = 5
 
-    func peek() {
+    func peek(previewImage: AnimatedImage? = nil, bypassCooldown: Bool = false,
+              stayDuration: TimeInterval? = nil, nextBreak: Date? = nil) {
         #if DEMO_CAPTURE
         let canShowWhileSharing = Settings.demoMode || !ShareGuard.isSharing()
         #else
         let canShowWhileSharing = !ShareGuard.isSharing()
         #endif
-        guard !busy, Date().timeIntervalSince(lastEnd) >= cooldown,
+        guard !busy, (bypassCooldown || Date().timeIntervalSince(lastEnd) >= cooldown),
               canShowWhileSharing, let screen = NSScreen.main else { return }
         busy = true
 
-        let size: CGFloat = 170
+        let message: String? = nextBreak.map { deadline in
+            let minutes = max(1, Int((deadline.timeIntervalSinceNow / 60).rounded(.up)))
+            let unit = minutes == 1 ? "min" : "mins"
+            return "You have \(minutes) \(unit) left till a break, meow!"
+        }
+        let bubbleSize = message.map(CatSpeechBubbleView.fittingSize(for:)) ?? .zero
+        let size = message == nil ? NSSize(width: 170, height: 170)
+            : NSSize(width: 170 + bubbleSize.width, height: 180)
         let margin: CGFloat = 28
         let onRight = Bool.random()
         let area = screen.visibleFrame
-        let x = onRight ? area.maxX - size - margin : area.minX + margin
-        let rect = NSRect(x: x, y: area.minY, width: size, height: size)
+        let x = onRight ? area.maxX - size.width - margin : area.minX + margin
+        let rect = NSRect(x: x, y: area.minY, width: size.width, height: size.height)
 
         let w = NSWindow(contentRect: rect, styleMask: .borderless, backing: .buffered, defer: false)
         w.isOpaque = false
@@ -558,33 +856,42 @@ final class CatPeeker {
         w.isReleasedWhenClosed = false
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
-        let cat = CatView(frame: NSRect(origin: .zero, size: rect.size))
-        cat.facingLeft = onRight
-        cat.customImage = Settings.randomImage(for: .popup)
-        w.contentView = cat
+        let image = previewImage ?? Settings.randomImage(for: .popup)
+        let content = CatPopupContentView(frame: NSRect(origin: .zero, size: rect.size),
+                                         image: image, catOnRight: onRight, message: message)
+        let cat = content.cat
+        w.contentView = content
         w.orderFrontRegardless()
         window = w
 
+        if previewImage == nil && Settings.popupOnlineGifs {
+            OnlineGIF.random(from: Settings.popupOnlineURL) { [weak self, weak cat, weak w] image in
+                guard let self, let cat, self.window === w, let image else { return }
+                cat.customImage = image
+            }
+        }
+
         var leaving = false
         // Slides the cat down from wherever it currently is, then tears everything down.
-        let leave = { [weak self, weak cat, weak w] in
-            guard let self, let cat, self.window === w, !leaving else { return }
+        let leave = { [weak self, weak content, weak w] in
+            guard let self, let content, self.window === w, !leaving else { return }
             leaving = true
             self.stayWork?.cancel()
             self.animation?.invalidate()
-            let from = cat.peek
-            self.animation = tween(duration: 0.5, easeOut: false, update: { cat.peek = from * (1 - $0) }, done: { [weak self] in
+            let from = content.peek
+            self.animation = tween(duration: 0.5, easeOut: false, update: { content.peek = from * (1 - $0) }, done: { [weak self] in
                 guard self?.window === w else { return }
                 self?.teardown()
             })
         }
         cat.onClick = leave
+        content.bubble?.onClick = leave
 
-        animation = tween(duration: 0.7, update: { cat.peek = $0 }, done: { [weak self] in
+        animation = tween(duration: 0.7, update: { content.peek = $0 }, done: { [weak self] in
             guard let self, self.window === w else { return }
             let work = DispatchWorkItem { leave() }
             self.stayWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + .random(in: Settings.peekStayRange), execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (stayDuration ?? .random(in: Settings.peekStayRange)), execute: work)
         })
     }
 
@@ -601,6 +908,12 @@ final class CatPeeker {
 
     /// Removes the cat immediately (used when a break starts).
     func dismissNow() { teardown() }
+
+    /// Shows the onboarding sample as a real corner visit, even if the normal cooldown is active.
+    func preview(image: AnimatedImage?, nextBreak: Date? = nil) {
+        if busy { dismissNow() }
+        peek(previewImage: image, bypassCooldown: true, stayDuration: 5, nextBreak: nextBreak)
+    }
 
 #if DEMO_CAPTURE
     func setSharingType(_ sharingType: NSWindow.SharingType) {
@@ -744,9 +1057,13 @@ final class BreakOverlay {
     private var windows: [OverlayWindow] = []
     private var countdownTimer: Timer?
     private var remaining = Settings.breakSeconds
+    private var closeFadeDuration: TimeInterval = 0.6
     private let countdownLabel = NSTextField(labelWithString: "")
     private var onFinish: ((_ snoozed: Bool) -> Void)?
     private weak var breakCat: CatView?
+    private weak var copyHintPill: NSView?
+    private weak var copyHintLabel: NSTextField?
+    private var isHoveringBreakGIF = false
 
     var isShowing: Bool { !windows.isEmpty }
 
@@ -756,10 +1073,13 @@ final class BreakOverlay {
     }
 #endif
 
-    func show(onFinish: @escaping (_ snoozed: Bool) -> Void) {
+    func show(durationOverride: Int? = nil, imageOverride: AnimatedImage? = nil,
+              showMessageOverride: Bool? = nil, onFinish: @escaping (_ snoozed: Bool) -> Void) {
         guard !isShowing else { return }
         self.onFinish = onFinish
-        remaining = Settings.breakSeconds
+        remaining = durationOverride ?? Settings.breakSeconds
+        closeFadeDuration = durationOverride == nil ? 0.6 : 0.15
+        let showMessage = showMessageOverride ?? Settings.showBreakMessage
 
         let shielding = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         let mainScreen = NSScreen.main
@@ -777,8 +1097,8 @@ final class BreakOverlay {
             w.alphaValue = 0
             let content = DismissView(frame: NSRect(origin: .zero, size: screen.frame.size))
             w.contentView = content
-            if Settings.showBreakMessage {
-                if screen == mainScreen { buildPrompt(in: content) }
+            if showMessage {
+                if screen == mainScreen { buildPrompt(in: content, imageOverride: imageOverride) }
             } else {
                 // Dim only: click anywhere (or press Esc) to dismiss early.
                 content.onClick = { [weak self] in self?.finish(snoozed: false) }
@@ -790,20 +1110,22 @@ final class BreakOverlay {
 
         // Swap in a random online GIF once it arrives; the local/drawn cat shows until then (or if it fails).
 #if DEMO_CAPTURE
-        let shouldFetchOnlineGif = !Settings.demoSequenceMode && Settings.onlineGifs && Settings.showBreakMessage
+        let shouldFetchOnlineGif = imageOverride == nil && !Settings.demoSequenceMode && Settings.onlineGifs && showMessage
 #else
-        let shouldFetchOnlineGif = Settings.onlineGifs && Settings.showBreakMessage
+        let shouldFetchOnlineGif = imageOverride == nil && Settings.onlineGifs && showMessage
 #endif
         if shouldFetchOnlineGif {
             OnlineGIF.random(from: Settings.onlineURL) { [weak self] image in
                 guard let self, self.isShowing, let image else { return }
-                self.breakCat?.customImage = image
+                guard let cat = self.breakCat else { return }
+                cat.customImage = image
+                if let parent = cat.superview { self.installCopyHint(for: image, cat: cat, in: parent) }
             }
         }
 
         NSApp.activate(ignoringOtherApps: true)
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 1.2
+            ctx.duration = durationOverride == nil ? 1.2 : 0.15
             windows.forEach { $0.animator().alphaValue = 1 }
         }
 
@@ -820,22 +1142,32 @@ final class BreakOverlay {
         countdownLabel.stringValue = "\(remaining)"
     }
 
-    private func buildPrompt(in view: NSView) {
+    private func buildPrompt(in view: NSView, imageOverride: AnimatedImage? = nil) {
         let b = view.bounds
         let cx = b.midX
-        let cat = CatView(frame: NSRect(x: cx - 120, y: b.midY + 20, width: 240, height: 240))
+        let cat = CatView(frame: NSRect(x: cx - 120, y: b.midY + 80, width: 240, height: 240))
         cat.peek = 1
-#if DEMO_CAPTURE
-        if Settings.demoSequenceMode {
-            cat.customImage = Bundle.main.url(forResource: "demo-cat", withExtension: "gif").flatMap(AnimatedImage.init(url:))
+        if let imageOverride {
+            cat.customImage = imageOverride
         } else {
-            cat.customImage = Settings.randomImage(for: .breakScreen) ?? Settings.randomImage(for: .popup)
-        }
+#if DEMO_CAPTURE
+            if Settings.demoSequenceMode {
+                cat.customImage = Bundle.main.url(forResource: "demo-cat", withExtension: "gif").flatMap(AnimatedImage.init(url:))
+            } else {
+                cat.customImage = Settings.randomImage(for: .breakScreen) ?? Settings.randomImage(for: .popup)
+            }
 #else
-        cat.customImage = Settings.randomImage(for: .breakScreen) ?? Settings.randomImage(for: .popup)
+            cat.customImage = Settings.randomImage(for: .breakScreen) ?? Settings.randomImage(for: .popup)
 #endif
+        }
         breakCat = cat
         view.addSubview(cat)
+        cat.onImageClick = { [weak self] in self?.copyBreakGIF() }
+        cat.onHoverChanged = { [weak self, weak cat] isHovering in
+            cat?.setGIFHovered(isHovering)
+            self?.setCopyHintHover(isHovering)
+        }
+        installCopyHint(for: cat.customImage, cat: cat, in: view)
 
         func label(_ text: String, size: CGFloat, weight: NSFont.Weight, y: CGFloat, alpha: CGFloat = 1) -> NSTextField {
             let l = NSTextField(labelWithString: text)
@@ -866,6 +1198,76 @@ final class BreakOverlay {
         view.addSubview(label("Press Esc to skip", size: 12, weight: .regular, y: b.midY - 270, alpha: 0.4))
     }
 
+    private func installCopyHint(for image: AnimatedImage?, cat: CatView, in view: NSView) {
+        guard copyHintLabel == nil,
+              let image,
+              FileManager.default.fileExists(atPath: image.fileURL.path),
+              let imageRect = cat.displayedImageRect(for: image) else { return }
+
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
+        pill.layer?.cornerRadius = 14
+        pill.layer?.borderWidth = 0.7
+        pill.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+        let inView = cat.convert(imageRect, to: view)
+        pill.frame = NSRect(x: inView.midX - 82, y: inView.minY - 38, width: 164, height: 28)
+        pill.alphaValue = 0
+        pill.isHidden = true
+
+        let label = NSTextField(labelWithString: "Click to copy GIF")
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .white
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: pill.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: pill.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: pill.trailingAnchor, constant: -12)
+        ])
+
+        view.addSubview(pill)
+        copyHintPill = pill
+        copyHintLabel = label
+        if isHoveringBreakGIF { setCopyHintHover(true) }
+    }
+
+    private func setCopyHintHover(_ isHovering: Bool) {
+        isHoveringBreakGIF = isHovering
+        guard let hint = copyHintPill else { return }
+        if isHovering, hint.isHidden {
+            hint.alphaValue = 0
+            hint.isHidden = false
+        }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.2
+            hint.animator().alphaValue = isHovering ? 1 : 0
+        }, completionHandler: { [weak self, weak hint] in
+            guard let self, let hint,
+                  self.copyHintPill === hint,
+                  !self.isHoveringBreakGIF else { return }
+            hint.isHidden = true
+        })
+    }
+
+    private func copyBreakGIF() {
+        guard let url = breakCat?.customImage?.fileURL,
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([url as NSURL]) else { return }
+        let hint = copyHintLabel
+        hint?.stringValue = "Copied"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { [weak self, weak hint] in
+            guard let self, let hint,
+                  self.copyHintLabel === hint,
+                  hint.stringValue == "Copied" else { return }
+            hint.stringValue = "Click to copy GIF"
+        }
+    }
+
     @objc private func skipTapped() { finish(snoozed: false) }
     @objc private func snoozeTapped() { finish(snoozed: true) }
 
@@ -876,13 +1278,17 @@ final class BreakOverlay {
         let closing = windows
         windows = []
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.6
+            ctx.duration = closeFadeDuration
             closing.forEach { $0.animator().alphaValue = 0 }
         }, completionHandler: {
             closing.forEach { $0.orderOut(nil) }
         })
         let cb = onFinish
         onFinish = nil
+        isHoveringBreakGIF = false
+        breakCat = nil
+        copyHintPill = nil
+        copyHintLabel = nil
         cb?(snoozed)
     }
 }
@@ -1109,9 +1515,9 @@ final class SettingsWindowController: NSWindowController {
     private func breaksPane() -> NSStackView {
         let local = pane([imageRow("My images", slot: .breakScreen), thumbnailStrip(slot: .breakScreen)])
         let web = pane([
-            textRow("Tenor page or words", placeholder: "https://tenor.com/search/aura-gifs", secure: false,
+            textRow("GIF search", placeholder: "cats, cozy, or a Tenor URL", secure: false,
                     get: { Settings.onlineURL }) { Settings.onlineURL = $0 },
-            hint("Paste a Tenor search page (or any page with GIFs), or just type words like “aura”. A random GIF from it is shown each break."),
+            hint("Type a few words or paste a Tenor page. A random GIF from the search appears each break."),
         ])
         [local, web].forEach { $0.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0) }
         refreshers.append {
@@ -1135,7 +1541,7 @@ final class SettingsWindowController: NSWindowController {
                     get: { Settings.dimPercent }, set: { Settings.dimPercent = $0 })),
             toggle("Show message and countdown (off = just dim)", get: { Settings.showBreakMessage }) { Settings.showBreakMessage = $0 },
             header("Picture on the break screen"),
-            picker("Show", items: ["My images (or a random cat)", "A random GIF from the web"],
+            picker("Show", items: ["My images (or a random cat)", "Random GIF from the web"],
                    get: { Settings.onlineGifs ? 1 : 0 }) { [weak self] in
                 Settings.onlineGifs = ($0 == 1)
                 self?.refresh()
@@ -1146,15 +1552,33 @@ final class SettingsWindowController: NSWindowController {
     }
 
     private func catPane() -> NSStackView {
-        pane([
+        let local = pane([imageRow("My images", slot: .popup), thumbnailStrip(slot: .popup)])
+        let web = pane([
+            textRow("GIF search", placeholder: "cats, loafing, tiny desk cats", secure: false,
+                    get: { Settings.popupOnlineURL }) { Settings.popupOnlineURL = $0 },
+            hint("Use a few words or a Tenor search page. A random GIF from the search appears with each visit."),
+        ])
+        [local, web].forEach { $0.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0) }
+        refreshers.append {
+            local.isHidden = Settings.popupOnlineGifs
+            web.isHidden = !Settings.popupOnlineGifs
+        }
+        local.isHidden = Settings.popupOnlineGifs
+        web.isHidden = !Settings.popupOnlineGifs
+
+        return pane([
             toggle("Let the cat visit", get: { Settings.catEnabled }) { Settings.catEnabled = $0 },
             row(Row(title: "Visits about every", unit: "min", range: 1...120,
                     get: { Settings.catEveryMinutes }, set: { Settings.catEveryMinutes = $0 })),
             row(Row(title: "Stays for about", unit: "sec", range: 2...60,
                     get: { Settings.catStaySeconds }, set: { Settings.catStaySeconds = $0 })),
-            header("Pop-up pictures"),
-            imageRow("My images", slot: .popup),
-            thumbnailStrip(slot: .popup),
+            picker("Show", items: ["My images or drawn cat", "Random GIF from the web"],
+                   get: { Settings.popupOnlineGifs ? 1 : 0 }) { [weak self] in
+                Settings.popupOnlineGifs = ($0 == 1)
+                self?.refresh()
+            },
+            local,
+            web,
         ])
     }
 
@@ -1405,6 +1829,247 @@ final class ActionBox: NSObject {
     @objc func fire() { body() }
 }
 
+private final class AnimatedPreviewView: NSView {
+    var image: AnimatedImage? { didSet { epoch = Date(); needsDisplay = true } }
+    private var epoch = Date()
+    private var timer: Timer?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        timer?.invalidate()
+        guard window != nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
+            self?.needsDisplay = true
+        }
+    }
+
+    func stopAnimating() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    deinit { timer?.invalidate() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlBackgroundColor.setFill()
+        NSBezierPath(rect: bounds).fill()
+        guard let image, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let scale = min(bounds.width / image.size.width, bounds.height / image.size.height)
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let rect = CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+                          width: size.width, height: size.height)
+        ctx.saveGState()
+        ctx.clip(to: bounds)
+        ctx.interpolationQuality = .high
+        ctx.draw(image.frame(at: Date().timeIntervalSince(epoch)), in: rect)
+        ctx.restoreGState()
+    }
+}
+
+private final class OnboardingWindowController: NSWindowController, NSWindowDelegate {
+    private let onPreviewPopup: (AnimatedImage?) -> Void
+    private let onPreviewBreak: (AnimatedImage?) -> Void
+    private let onFinish: (_ popupSearch: String, _ breakSearch: String) -> Void
+    private let popupPreview = AnimatedPreviewView(frame: .zero)
+    private let breakPreview = AnimatedPreviewView(frame: .zero)
+    private let popupSearch = NSTextField(string: "")
+    private let breakSearch = NSTextField(string: "")
+    private let popupStatus = NSTextField(labelWithString: "")
+    private let breakStatus = NSTextField(labelWithString: "")
+    private let gifSearchPane = NSStackView()
+    private weak var rootStack: NSStackView?
+    private var didFinish = false
+
+    init(onPreviewPopup: @escaping (AnimatedImage?) -> Void,
+         onPreviewBreak: @escaping (AnimatedImage?) -> Void,
+         onFinish: @escaping (_ popupSearch: String, _ breakSearch: String) -> Void) {
+        self.onPreviewPopup = onPreviewPopup
+        self.onPreviewBreak = onPreviewBreak
+        self.onFinish = onFinish
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 480),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Welcome to Stray Cat"
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        window.delegate = self
+        build()
+        window.center()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func present() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func finishWithDefaults() { finish() }
+
+    private func build() {
+        popupPreview.image = bundledPreview("onboarding-popup")
+        breakPreview.image = bundledPreview("onboarding-break")
+
+        let title = NSTextField(labelWithString: "A little company for your Mac")
+        title.font = .systemFont(ofSize: 24, weight: .semibold)
+        let subtitle = NSTextField(wrappingLabelWithString:
+            "A cat drops by now and then. When it’s time to rest, Stray Cat helps you look away."
+        )
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.preferredMaxLayoutWidth = 660
+        subtitle.alignment = .center
+
+        let examples = NSStackView(views: [
+            previewCard(title: "Cat visits", caption: "A little pop-up in the corner.", preview: popupPreview),
+            previewCard(title: "Break time", caption: "A gentle pause with a countdown.", preview: breakPreview),
+        ])
+        examples.orientation = .horizontal
+        examples.alignment = .top
+        examples.spacing = 16
+
+        let customize = NSButton(title: "Find GIFs (optional)", target: self, action: #selector(toggleGIFSearch))
+        customize.bezelStyle = .rounded
+
+        let popupRow = searchRow("Cat visits", field: popupSearch, buttonTitle: "Preview", action: #selector(previewPopupGIF))
+        let breakRow = searchRow("Break screen", field: breakSearch, buttonTitle: "Preview", action: #selector(previewBreakGIF))
+        let searchHint = NSTextField(wrappingLabelWithString:
+            "Search for a GIF if you like. Preview shows it on your screen; Start saves your searches."
+        )
+        searchHint.font = .systemFont(ofSize: 11)
+        searchHint.textColor = .secondaryLabelColor
+        searchHint.preferredMaxLayoutWidth = 650
+        gifSearchPane.orientation = .vertical
+        gifSearchPane.alignment = .leading
+        gifSearchPane.spacing = 5
+        gifSearchPane.addArrangedSubview(popupRow)
+        gifSearchPane.addArrangedSubview(popupStatus)
+        gifSearchPane.addArrangedSubview(breakRow)
+        gifSearchPane.addArrangedSubview(breakStatus)
+        gifSearchPane.addArrangedSubview(searchHint)
+        gifSearchPane.isHidden = true
+
+        let start = NSButton(title: "Start", target: self, action: #selector(startTapped))
+        start.bezelStyle = .rounded
+        start.controlSize = .large
+        start.keyEquivalent = "\r"
+        let footnote = NSTextField(labelWithString: "You can change settings anytime from the cat in your menu bar.")
+        footnote.font = .systemFont(ofSize: 11)
+        footnote.textColor = .secondaryLabelColor
+
+        let root = NSStackView(views: [title, subtitle, examples, customize, gifSearchPane, start, footnote])
+        root.orientation = .vertical
+        root.alignment = .centerX
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 20, right: 24)
+        window?.contentView = root
+        window?.setContentSize(NSSize(width: 740, height: max(480, root.fittingSize.height)))
+        rootStack = root
+    }
+
+    private func previewCard(title: String, caption: String, preview: AnimatedPreviewView) -> NSView {
+        preview.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            preview.widthAnchor.constraint(equalToConstant: 318),
+            preview.heightAnchor.constraint(equalToConstant: 176),
+        ])
+        preview.wantsLayer = true
+        preview.layer?.cornerRadius = 8
+        preview.layer?.masksToBounds = true
+
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        let detail = NSTextField(labelWithString: caption)
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        let card = NSStackView(views: [preview, heading, detail])
+        card.orientation = .vertical
+        card.alignment = .leading
+        card.spacing = 6
+        card.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        card.layer?.cornerRadius = 11
+        return card
+    }
+
+    private func searchRow(_ title: String, field: NSTextField, buttonTitle: String, action: Selector) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.widthAnchor.constraint(equalToConstant: 100).isActive = true
+        field.placeholderString = "cats, loafing, tiny desk cats"
+        field.widthAnchor.constraint(equalToConstant: 390).isActive = true
+        field.target = self
+        field.action = action
+        let button = NSButton(title: buttonTitle, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        let row = NSStackView(views: [label, field, button])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    private func bundledPreview(_ name: String) -> AnimatedImage? {
+        Bundle.main.url(forResource: name, withExtension: "gif").flatMap(AnimatedImage.init(url:))
+    }
+
+    @objc private func toggleGIFSearch() {
+        gifSearchPane.isHidden.toggle()
+        if let rootStack {
+            rootStack.layoutSubtreeIfNeeded()
+            window?.setContentSize(NSSize(width: 740, height: max(480, rootStack.fittingSize.height)))
+        }
+        window?.center()
+    }
+
+    @objc private func previewPopupGIF() {
+        preview(query: popupSearch.stringValue, into: popupPreview, status: popupStatus,
+                action: onPreviewPopup, defaultStatus: "Showing the sample cat visit.",
+                resultStatus: "Showing a random cat visit on your screen.")
+    }
+    @objc private func previewBreakGIF() {
+        preview(query: breakSearch.stringValue, into: breakPreview, status: breakStatus,
+                action: onPreviewBreak, defaultStatus: "Starting a three-second sample break.",
+                resultStatus: "Starting a three-second break.")
+    }
+
+    private func preview(query: String, into target: AnimatedPreviewView, status: NSTextField,
+                         action: @escaping (AnimatedImage?) -> Void, defaultStatus: String,
+                         resultStatus: String) {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            status.stringValue = defaultStatus
+            action(target.image)
+            return
+        }
+        status.stringValue = "Looking for a GIF…"
+        OnlineGIF.random(from: query) { [weak self, weak target, weak status] image in
+            guard let self, !self.didFinish else { return }
+            guard let image else {
+                status?.stringValue = "No match found. Showing the sample instead."
+                action(target?.image)
+                return
+            }
+            target?.image = image
+            status?.stringValue = resultStatus
+            action(image)
+        }
+    }
+
+    @objc private func startTapped() { finish() }
+
+    private func finish() {
+        guard !didFinish else { return }
+        didFinish = true
+        popupPreview.stopAnimating()
+        breakPreview.stopAnimating()
+        onFinish(popupSearch.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+                 breakSearch.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        window?.orderOut(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) { finish() }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1412,6 +2077,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let peeker = CatPeeker()
     private let overlay = BreakOverlay()
     private let headsUp = HeadsUp()
+    private var onboardingController: OnboardingWindowController?
+    private var onboardingActive = false
+    private var scheduledFeaturesStarted = false
     private var peekTimer: Timer?
     private var breakTimer: Timer?
     private var nextBreak: Date?
@@ -1458,7 +2126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             let visible = self.statusItem.button?.window?.isVisible == true
                 && self.statusItem.button?.window?.occlusionState.contains(.visible) == true
-            if !visible { self.openSettings() }
+            if !visible && !self.onboardingActive { self.openSettings() }
         }
 
         // A cat that is already up when a screen share starts leaves immediately.
@@ -1467,11 +2135,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.peeker.dismissNow()
         }
 
-        scheduleBreak(after: Settings.breakInterval)
-        schedulePeek()
-        // Say hello shortly after launch.
-        if Settings.catEnabled {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.peeker.peek() }
+        var showOnboarding = Settings.shouldShowOnboarding()
+#if DEMO_CAPTURE
+        if launchArguments.contains("--demo-sequence") { showOnboarding = false }
+#endif
+        if showOnboarding {
+            onboardingActive = true
+            onboardingController = OnboardingWindowController(
+                onPreviewPopup: { [weak self] image in self?.previewPopup(image: image) },
+                onPreviewBreak: { [weak self] image in self?.previewBreak(image: image) },
+                onFinish: { [weak self] popupSearch, breakSearch in
+                    self?.finishOnboarding(popupSearch: popupSearch, breakSearch: breakSearch)
+                }
+            )
+            onboardingController?.present()
+        } else {
+            startScheduledFeatures()
         }
 #if DEMO_CAPTURE
         if launchArguments.contains("--demo-sequence") {
@@ -1482,13 +2161,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 #endif
     }
 
+    private func finishOnboarding(popupSearch: String, breakSearch: String) {
+        if !popupSearch.isEmpty {
+            Settings.popupOnlineURL = popupSearch
+            Settings.popupOnlineGifs = true
+        }
+        if !breakSearch.isEmpty {
+            Settings.onlineURL = breakSearch
+            Settings.onlineGifs = true
+        }
+        Settings.markOnboardingComplete()
+        onboardingActive = false
+        startScheduledFeatures()
+    }
+
+    private func previewPopup(image: AnimatedImage?) {
+        peeker.preview(image: image, nextBreak: nextBreak)
+    }
+
+    private func previewBreak(image: AnimatedImage?) {
+        overlay.show(durationOverride: 3, imageOverride: image, showMessageOverride: true) { _ in }
+    }
+
+    private func startScheduledFeatures() {
+        guard !scheduledFeaturesStarted else { return }
+        scheduledFeaturesStarted = true
+        scheduleBreak(after: Settings.breakInterval)
+        schedulePeek()
+        if Settings.catEnabled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self else { return }
+                self.peeker.peek(nextBreak: self.nextBreak)
+            }
+        }
+    }
+
     private func schedulePeek() {
         peekTimer?.invalidate()
         peekTimer = nil
         guard Settings.catEnabled else { return }
         peekTimer = Timer.scheduledTimer(withTimeInterval: .random(in: Settings.peekDelayRange), repeats: false) { [weak self] _ in
             guard let self else { return }
-            if !self.overlay.isShowing && !self.headsUp.isShowing { self.peeker.peek() }
+            if !self.overlay.isShowing && !self.headsUp.isShowing { self.peeker.peek(nextBreak: self.nextBreak) }
             self.schedulePeek()
         }
     }
@@ -1507,7 +2221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Starts the break flow: an optional heads-up countdown first, then the dimmed break screen.
     private func startBreak(warn: Bool = true, countdown: Int? = nil) {
-        guard !overlay.isShowing, !headsUp.isShowing else { return }
+        guard !onboardingActive, !overlay.isShowing, !headsUp.isShowing else { return }
         // Never dim the screen while it may be visible to other people; retry shortly.
 #if DEMO_CAPTURE
         let canStartWhileSharing = Settings.demoMode
@@ -1517,6 +2231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !canStartWhileSharing && ShareGuard.isSharing() {
             breakWaiting = true
             breakTimer?.invalidate()
+            nextBreak = Date().addingTimeInterval(30)
             breakTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in self?.startBreak() }
             return
         }
@@ -1527,7 +2242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if warn && warnSeconds > 0 {
             breakTimer?.invalidate()
             breakTimer = nil
-            nextBreak = nil
+            nextBreak = Date().addingTimeInterval(TimeInterval(warnSeconds))
             headsUp.show(seconds: warnSeconds) { [weak self] outcome in
                 switch outcome {
                 case .start: self?.beginBreak()
@@ -1542,6 +2257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func beginBreak() {
+        nextBreak = nil
         overlay.show { [weak self] snoozed in
             self?.lastBreakEnd = Date()
             self?.scheduleBreak(after: snoozed ? TimeInterval(Settings.snoozeMinutes * 60) : Settings.breakInterval)
@@ -1551,11 +2267,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Re-arms both timers so edited intervals and toggles take effect right away.
     private func settingsChanged() {
         if !overlay.isShowing && !headsUp.isShowing { scheduleBreak(after: Settings.breakInterval) }
-        if headsUp.isShowing && !Settings.breaksEnabled { headsUp.cancel() }
+        if headsUp.isShowing && !Settings.breaksEnabled {
+            headsUp.cancel()
+            nextBreak = nil
+        }
         schedulePeek()
     }
 
-    @objc private func peekNow() { if !overlay.isShowing && !headsUp.isShowing { peeker.peek() } }
+    @objc private func peekNow() {
+        if !onboardingActive && !overlay.isShowing && !headsUp.isShowing { peeker.peek(nextBreak: nextBreak) }
+    }
 
 #if DEMO_CAPTURE
     @objc private func toggleDemoMode(_ sender: NSMenuItem) {
@@ -1578,16 +2299,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Always shows the countdown, even if "Warn me first" is set to 0.
         startBreak(countdown: max(Settings.warnSeconds, 15))
     }
-    @objc private func openSettings() { settingsController.present() }
+    @objc private func openSettings() {
+        if onboardingActive { onboardingController?.finishWithDefaults() }
+        settingsController.present()
+    }
 
     /// Launching the app again (Finder, Spotlight, `open`) opens Settings.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if onboardingActive {
+            onboardingController?.present()
+            return true
+        }
         openSettings()
         return true
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        if headsUp.isShowing {
+        if onboardingActive {
+            nextBreakItem.title = "Finish setup to start reminders"
+        } else if headsUp.isShowing {
             nextBreakItem.title = "Break starting soon"
         } else if overlay.isShowing {
             nextBreakItem.title = "Break in progress"
