@@ -15,6 +15,8 @@ for arch in arm64 x86_64; do
     # DEMO_SWIFT_FLAGS is an optional pair of fixed compiler arguments.
     swiftc $DEMO_SWIFT_FLAGS -O -swift-version 5 -target "$arch-apple-macos13.0" \
         -framework AppKit -framework ServiceManagement -framework CoreAudio \
+        -framework CoreImage \
+        -framework AVFoundation -framework Vision \
         -o "build/.$arch" Sources/main.swift
 done
 lipo -create build/.arm64 build/.x86_64 -output "$APP/Contents/MacOS/StrayCat"

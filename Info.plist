@@ -22,5 +22,7 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Stray Cat uses the camera only during breaks when you enable camera-confirmed time away. Person detection happens on this Mac; video is not saved or uploaded.</string>
 </dict>
 </plist>

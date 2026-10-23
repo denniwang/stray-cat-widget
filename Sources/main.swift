@@ -1,8 +1,11 @@
 import AppKit
+import AVFoundation
 import CoreAudio
+import CoreImage
 import ImageIO
 import ServiceManagement
 import UniformTypeIdentifiers
+import Vision
 
 // MARK: - Settings
 
@@ -27,6 +30,7 @@ enum Settings {
             "catEnabled": true, "catEveryMinutes": 8, "catStaySeconds": 6,
             "popupOnlineGifs": false, "popupOnlineURL": "",
             "showBreakMessage": true, "holdDuringShare": true, "holdDuringCalls": true,
+            "requireAwayForBreak": false,
             "warnSeconds": 15, "onlineGifs": true, "onlineURL": "cats",
         ])
     }
@@ -39,6 +43,7 @@ enum Settings {
     static var onlineGifs: Bool { get { d.bool(forKey: "onlineGifs") } set { d.set(newValue, forKey: "onlineGifs") } }
     static var onlineURL: String { get { d.string(forKey: "onlineURL") ?? "" } set { d.set(newValue, forKey: "onlineURL") } }
     static var showBreakMessage: Bool { get { d.bool(forKey: "showBreakMessage") } set { d.set(newValue, forKey: "showBreakMessage") } }
+    static var requireAwayForBreak: Bool { get { d.bool(forKey: "requireAwayForBreak") } set { d.set(newValue, forKey: "requireAwayForBreak") } }
 
     static func shouldShowOnboarding() -> Bool {
         let key = "hasCompletedOnboarding"
@@ -1043,6 +1048,208 @@ private final class DismissView: NSView {
     override func mouseDown(with event: NSEvent) { onClick?() }
 }
 
+/// Checks camera frames locally during opted-in breaks. Frames are analyzed in memory and discarded.
+private final class BreakPresenceMonitor: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    enum State: Equatable {
+        case waiting
+        case away
+        case personDetected
+        case unavailable(String)
+
+        var message: String {
+            switch self {
+            case .waiting: return "Waiting for camera…"
+            case .away: return "No person in view — timer running"
+            case .personDetected: return "Person in view — timer paused"
+            case .unavailable(let message): return message
+            }
+        }
+    }
+
+    private let captureQueue = DispatchQueue(label: "local.dennis.straycat.break-camera")
+    private let analysisQueue = DispatchQueue(label: "local.dennis.straycat.break-vision")
+    private let stateLock = NSLock()
+    private let humanRequest = VNDetectHumanRectanglesRequest()
+    private let imageContext = CIContext()
+    private let onStateChange: (State, CGImage?) -> Void
+    private var session: AVCaptureSession?
+    private var videoOutput: AVCaptureVideoDataOutput?
+    private var state: State = .waiting
+    private var monitoringSince: Date?
+    private var lastFrameAt: Date?
+    private var lastAnalysisAt = Date.distantPast
+    private var lastPreviewAt = Date.distantPast
+    private var stopped = false
+
+    init(onStateChange: @escaping (State, CGImage?) -> Void) {
+        self.onStateChange = onStateChange
+        super.init()
+        humanRequest.upperBodyOnly = true
+    }
+
+    func start() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureAndStart()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] allowed in
+                guard let self else { return }
+                if allowed {
+                    self.configureAndStart()
+                } else {
+                    self.publish(.unavailable("Camera access is off — regular timer continues"))
+                }
+            }
+        case .denied, .restricted:
+            publish(.unavailable("Camera access is off — regular timer continues"))
+        @unknown default:
+            publish(.unavailable("Camera unavailable — regular timer continues"))
+        }
+    }
+
+    /// Returns a fail-open state if the camera stops delivering frames.
+    func countdownState() -> State {
+        stateLock.lock()
+        var current = state
+        if case .unavailable = current {
+            stateLock.unlock()
+            return current
+        }
+        let reference = lastFrameAt ?? monitoringSince
+        let feedIsStale = reference.map { Date().timeIntervalSince($0) > 6 } ?? false
+        if feedIsStale {
+            current = .unavailable("Camera feed paused — regular timer continues")
+            state = current
+        }
+        stateLock.unlock()
+        if feedIsStale { notify(current, previewFrame: nil) }
+        return current
+    }
+
+    func stop() {
+        stateLock.lock()
+        stopped = true
+        stateLock.unlock()
+
+        captureQueue.async { [weak self] in
+            guard let self, let session = self.session else { return }
+            self.videoOutput?.setSampleBufferDelegate(nil, queue: nil)
+            if session.isRunning { session.stopRunning() }
+            self.videoOutput = nil
+            self.session = nil
+        }
+    }
+
+    private func configureAndStart() {
+        captureQueue.async { [weak self] in
+            guard let self, !self.isStopped else { return }
+            guard let camera = AVCaptureDevice.default(for: .video) else {
+                self.publish(.unavailable("No camera found — regular timer continues"))
+                return
+            }
+
+            let session = AVCaptureSession()
+            session.beginConfiguration()
+            do {
+                if session.canSetSessionPreset(.medium) { session.sessionPreset = .medium }
+                let input = try AVCaptureDeviceInput(device: camera)
+                guard session.canAddInput(input) else {
+                    throw NSError(domain: "StrayCatCamera", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Camera input unavailable"])
+                }
+                session.addInput(input)
+
+                let output = AVCaptureVideoDataOutput()
+                output.alwaysDiscardsLateVideoFrames = true
+                output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+                output.setSampleBufferDelegate(self, queue: analysisQueue)
+                guard session.canAddOutput(output) else {
+                    throw NSError(domain: "StrayCatCamera", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "Camera video unavailable"])
+                }
+                session.addOutput(output)
+                session.commitConfiguration()
+                self.session = session
+                self.videoOutput = output
+                self.publish(.waiting, resetWatchdog: true)
+                session.startRunning()
+            } catch {
+                session.commitConfiguration()
+                self.publish(.unavailable("Camera unavailable — regular timer continues"))
+            }
+        }
+    }
+
+    private var isStopped: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped
+    }
+
+    private func publish(_ next: State, frameAt: Date? = nil, resetWatchdog: Bool = false) {
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
+        if resetWatchdog {
+            monitoringSince = Date()
+            lastFrameAt = nil
+        }
+        if let frameAt { lastFrameAt = frameAt }
+        let changed = state != next
+        state = next
+        stateLock.unlock()
+        if changed { notify(next, previewFrame: nil) }
+    }
+
+    private func publishFrame(_ frame: CGImage?, at time: Date) {
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
+        lastFrameAt = time
+        let current = state
+        stateLock.unlock()
+        if let frame { notify(current, previewFrame: frame) }
+    }
+
+    private func notify(_ state: State, previewFrame: CGImage?) {
+        DispatchQueue.main.async { [weak self] in self?.onStateChange(state, previewFrame) }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        let now = Date()
+        let shouldAnalyze = now.timeIntervalSince(lastAnalysisAt) >= 1
+        let shouldRefreshPreview = now.timeIntervalSince(lastPreviewAt) >= 0.2
+        guard shouldAnalyze || shouldRefreshPreview else { return }
+
+        if shouldAnalyze {
+            lastAnalysisAt = now
+            do {
+                let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, options: [:])
+                try handler.perform([humanRequest])
+                let personVisible = (humanRequest.results ?? []).contains { $0.confidence >= 0.4 }
+                publish(personVisible ? .personDetected : .away, frameAt: now)
+            } catch {
+                publish(.unavailable("Camera check failed — regular timer continues"), frameAt: now)
+            }
+        } else {
+            publishFrame(nil, at: now)
+        }
+
+        if shouldRefreshPreview {
+            lastPreviewAt = now
+            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            let image = CIImage(cvPixelBuffer: pixelBuffer)
+            let frame = imageContext.createCGImage(image, from: image.extent)
+            publishFrame(frame, at: now)
+        }
+    }
+}
+
 private final class OverlayWindow: NSWindow {
     var onEscape: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -1057,8 +1264,15 @@ final class BreakOverlay {
     private var windows: [OverlayWindow] = []
     private var countdownTimer: Timer?
     private var remaining = Settings.breakSeconds
+    private var presenceDuration = Settings.breakSeconds
+    private var presenceMonitor: BreakPresenceMonitor?
+    private var presenceRequired = false
+    private var timerTicks = 0
     private var closeFadeDuration: TimeInterval = 0.6
     private let countdownLabel = NSTextField(labelWithString: "")
+    private let presenceStatusLabel = NSTextField(labelWithString: "")
+    private let cameraPreviewBorder = NSView()
+    private let cameraPreviewImage = NSImageView()
     private var onFinish: ((_ snoozed: Bool) -> Void)?
     private weak var breakCat: CatView?
     private weak var copyHintPill: NSView?
@@ -1078,8 +1292,12 @@ final class BreakOverlay {
         guard !isShowing else { return }
         self.onFinish = onFinish
         remaining = durationOverride ?? Settings.breakSeconds
+        presenceDuration = remaining
+        timerTicks = 0
+        presenceRequired = durationOverride == nil && Settings.requireAwayForBreak
         closeFadeDuration = durationOverride == nil ? 0.6 : 0.15
-        let showMessage = showMessageOverride ?? Settings.showBreakMessage
+        // Camera-confirmed breaks need a visible countdown and camera status even in dim-only mode.
+        let showMessage = showMessageOverride ?? (Settings.showBreakMessage || presenceRequired)
 
         let shielding = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         let mainScreen = NSScreen.main
@@ -1098,7 +1316,9 @@ final class BreakOverlay {
             let content = DismissView(frame: NSRect(origin: .zero, size: screen.frame.size))
             w.contentView = content
             if showMessage {
-                if screen == mainScreen { buildPrompt(in: content, imageOverride: imageOverride) }
+                if screen == mainScreen {
+                    buildPrompt(in: content, imageOverride: imageOverride, showPresenceStatus: presenceRequired)
+                }
             } else {
                 // Dim only: click anywhere (or press Esc) to dismiss early.
                 content.onClick = { [weak self] in self?.finish(snoozed: false) }
@@ -1130,19 +1350,71 @@ final class BreakOverlay {
         }
 
         updateCountdown()
+        if presenceRequired {
+            setPresenceStatus(.waiting)
+            let monitor = BreakPresenceMonitor { [weak self] state, frame in
+                guard let self, self.isShowing, self.presenceRequired, self.presenceMonitor != nil else { return }
+                self.setPresenceStatus(state, previewFrame: frame)
+            }
+            presenceMonitor = monitor
+            monitor.start()
+        }
         countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
+            self.timerTicks += 1
+            if self.timerTicks % 5 == 0 && ShareGuard.isSharing() { self.finish(snoozed: false); return }
+
+            if let monitor = self.presenceMonitor {
+                switch monitor.countdownState() {
+                case .waiting:
+                    return
+                case .personDetected:
+                    if self.remaining != self.presenceDuration {
+                        self.remaining = self.presenceDuration
+                        self.updateCountdown()
+                    }
+                    return
+                case .away:
+                    break
+                case .unavailable(let message):
+                    self.setPresenceStatus(.unavailable(message))
+                    monitor.stop()
+                    self.presenceMonitor = nil
+                }
+            }
+
             self.remaining -= 1
-            if self.remaining % 5 == 0 && ShareGuard.isSharing() { self.finish(snoozed: false); return }
             if self.remaining <= 0 { self.finish(snoozed: false) } else { self.updateCountdown() }
         }
+    }
+
+    private func setPresenceStatus(_ state: BreakPresenceMonitor.State, previewFrame: CGImage? = nil) {
+        presenceStatusLabel.stringValue = state.message
+        if let previewFrame {
+            cameraPreviewImage.image = NSImage(cgImage: previewFrame,
+                                               size: NSSize(width: previewFrame.width, height: previewFrame.height))
+        }
+        switch state {
+        case .personDetected:
+            cameraPreviewBorder.layer?.borderColor = NSColor.systemRed.cgColor
+        case .away:
+            cameraPreviewBorder.layer?.borderColor = NSColor.systemGreen.cgColor
+        case .waiting:
+            cameraPreviewBorder.layer?.borderColor = NSColor.white.withAlphaComponent(0.5).cgColor
+        case .unavailable:
+            presenceStatusLabel.textColor = NSColor.systemYellow.withAlphaComponent(0.9)
+            cameraPreviewBorder.layer?.borderColor = NSColor.systemYellow.cgColor
+        }
+        if case .unavailable = state { return }
+        presenceStatusLabel.textColor = NSColor.white.withAlphaComponent(0.72)
     }
 
     private func updateCountdown() {
         countdownLabel.stringValue = "\(remaining)"
     }
 
-    private func buildPrompt(in view: NSView, imageOverride: AnimatedImage? = nil) {
+    private func buildPrompt(in view: NSView, imageOverride: AnimatedImage? = nil,
+                             showPresenceStatus: Bool = false) {
         let b = view.bounds
         let cx = b.midX
         let cat = CatView(frame: NSRect(x: cx - 120, y: b.midY + 80, width: 240, height: 240))
@@ -1178,24 +1450,61 @@ final class BreakOverlay {
             return l
         }
         view.addSubview(label("Time for a break", size: 44, weight: .semibold, y: b.midY - 40))
-        view.addSubview(label("Look away from the screen. Stretch, breathe, drink some water.",
-                              size: 18, weight: .regular, y: b.midY - 80, alpha: 0.75))
+        let subtitle = showPresenceStatus
+            ? "Step out of view; the timer pauses if it sees you."
+            : "Look away from the screen. Stretch, breathe, drink some water."
+        view.addSubview(label(subtitle, size: 18, weight: .regular, y: b.midY - 80, alpha: 0.75))
+
+        presenceStatusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        presenceStatusLabel.textColor = NSColor.white.withAlphaComponent(0.72)
+        presenceStatusLabel.alignment = .center
+        presenceStatusLabel.frame = NSRect(x: 0, y: b.midY - 116, width: b.width, height: 18)
+        presenceStatusLabel.isHidden = !showPresenceStatus
+        view.addSubview(presenceStatusLabel)
+
+        let previewSize = NSSize(width: 224, height: 150)
+        cameraPreviewBorder.frame = NSRect(x: b.width - previewSize.width - 28,
+                                           y: b.height - previewSize.height - 48,
+                                           width: previewSize.width, height: previewSize.height)
+        cameraPreviewBorder.wantsLayer = true
+        cameraPreviewBorder.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.8).cgColor
+        cameraPreviewBorder.layer?.borderWidth = 4
+        cameraPreviewBorder.layer?.borderColor = NSColor.white.withAlphaComponent(0.5).cgColor
+        cameraPreviewBorder.layer?.cornerRadius = 12
+        cameraPreviewBorder.layer?.masksToBounds = true
+        cameraPreviewBorder.isHidden = !showPresenceStatus
+        cameraPreviewImage.frame = cameraPreviewBorder.bounds.insetBy(dx: 4, dy: 4)
+        cameraPreviewImage.imageScaling = .scaleProportionallyUpOrDown
+        cameraPreviewImage.image = nil
+        cameraPreviewBorder.addSubview(cameraPreviewImage)
+        view.addSubview(cameraPreviewBorder)
+
+        let cameraTitle = label("CAMERA VIEW", size: 10, weight: .semibold,
+                                y: cameraPreviewBorder.frame.maxY + 5, alpha: 0.72)
+        cameraTitle.frame.origin.x = cameraPreviewBorder.frame.minX
+        cameraTitle.frame.size.width = previewSize.width
+        cameraTitle.alignment = .left
+        cameraTitle.isHidden = !showPresenceStatus
+        view.addSubview(cameraTitle)
 
         countdownLabel.font = .monospacedDigitSystemFont(ofSize: 64, weight: .light)
         countdownLabel.textColor = .white
         countdownLabel.alignment = .center
-        countdownLabel.frame = NSRect(x: 0, y: b.midY - 170, width: b.width, height: 80)
+        countdownLabel.frame = NSRect(x: 0, y: b.midY - (showPresenceStatus ? 194 : 170),
+                                      width: b.width, height: showPresenceStatus ? 72 : 80)
         view.addSubview(countdownLabel)
 
         let skip = NSButton(title: "Skip", target: self, action: #selector(skipTapped))
         skip.bezelStyle = .rounded
-        skip.frame = NSRect(x: cx - 125, y: b.midY - 230, width: 120, height: 32)
+        let buttonY = b.midY - (showPresenceStatus ? 246 : 230)
+        skip.frame = NSRect(x: cx - 125, y: buttonY, width: 120, height: 32)
         let snooze = NSButton(title: "Snooze 5 min", target: self, action: #selector(snoozeTapped))
         snooze.bezelStyle = .rounded
-        snooze.frame = NSRect(x: cx + 5, y: b.midY - 230, width: 120, height: 32)
+        snooze.frame = NSRect(x: cx + 5, y: buttonY, width: 120, height: 32)
         view.addSubview(skip)
         view.addSubview(snooze)
-        view.addSubview(label("Press Esc to skip", size: 12, weight: .regular, y: b.midY - 270, alpha: 0.4))
+        view.addSubview(label("Press Esc to skip", size: 12, weight: .regular,
+                              y: buttonY - 40, alpha: 0.4))
     }
 
     private func installCopyHint(for image: AnimatedImage?, cat: CatView, in view: NSView) {
@@ -1275,6 +1584,10 @@ final class BreakOverlay {
         guard isShowing else { return }
         countdownTimer?.invalidate()
         countdownTimer = nil
+        presenceMonitor?.stop()
+        presenceMonitor = nil
+        presenceRequired = false
+        cameraPreviewImage.image = nil
         let closing = windows
         windows = []
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -1540,6 +1853,8 @@ final class SettingsWindowController: NSWindowController {
             row(Row(title: "Screen dimming", unit: "%", range: 10...100,
                     get: { Settings.dimPercent }, set: { Settings.dimPercent = $0 })),
             toggle("Show message and countdown (off = just dim)", get: { Settings.showBreakMessage }) { Settings.showBreakMessage = $0 },
+            toggle("Use camera presence check during breaks", get: { Settings.requireAwayForBreak }) { Settings.requireAwayForBreak = $0 },
+            hint("The timer counts down only while no person is visible to the camera. Detection runs on this Mac; video is not saved or uploaded. It cannot verify whether you have physically left your desk. If the camera is unavailable, the regular timer continues."),
             header("Picture on the break screen"),
             picker("Show", items: ["My images (or a random cat)", "Random GIF from the web"],
                    get: { Settings.onlineGifs ? 1 : 0 }) { [weak self] in
